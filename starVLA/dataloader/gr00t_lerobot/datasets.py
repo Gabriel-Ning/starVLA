@@ -28,6 +28,8 @@ import hashlib
 import io
 import json, torch
 import copy
+import shutil
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
@@ -212,17 +214,48 @@ def _load_stats_cache(
     return statistics
 
 
+def _commit_cache_file(dest_path: Path, write_fn) -> None:
+    """Write ``dest_path`` without ``os.replace``.
+
+    If the cache file is already in the dataset directory, leave it.
+    Otherwise write it in ``TMPDIR``, copy it onto ``dest_path``, then delete
+    the temp file. ``TMPDIR`` must already be set. ``dest_path`` is the
+    original dataset cache path.
+    """
+    if dest_path.is_file():
+        return
+
+    tmp_dir = os.environ.get("TMPDIR")
+    if not tmp_dir:
+        raise RuntimeError(
+            "TMPDIR is not set. Dataset cache files are written there before "
+            "being copied onto the dataset path."
+        )
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{dest_path.name}.", dir=tmp_dir)
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        write_fn(tmp_path)
+        if dest_path.is_file():
+            return
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(tmp_path, dest_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def _save_stats_cache(stats_path: Path, cache_config: dict, statistics: dict) -> None:
     payload = {
         "__format_version": LE_ROBOT_STATS_FORMAT_VERSION,
         "__cache_config": cache_config,
         "statistics": statistics,
     }
-    tmp_path = stats_path.with_suffix(".tmp")
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(tmp_path, "w") as f:
-        json.dump(payload, f, indent=4)
-    os.replace(tmp_path, stats_path)
+
+    def _write(path: Path) -> None:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=4)
+
+    _commit_cache_file(stats_path, _write)
 
 
 def _compute_statistics_for_mode(
@@ -996,6 +1029,10 @@ class LeRobotSingleDataset(Dataset):
                     f"[RANK {os.environ.get('RANK', 'NA')}] "
                     f"Failed to load cached steps ({e}), will rebuild."
                 )
+                # _commit_cache_file leaves an existing dest in place. Drop the
+                # bad file on rank 0 before rebuilding so it is not reused.
+                if is_main():
+                    steps_path.unlink(missing_ok=True)
     
         # ---------- only build by rank0  ----------
         if is_main():
@@ -1009,14 +1046,12 @@ class LeRobotSingleDataset(Dataset):
                 "computed_timestamp": pd.Timestamp.now().isoformat(),
                 "delete_pause_frame": self.delete_pause_frame,
             }
-    
-            steps_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = steps_path.with_suffix(".tmp")
-    
-            with open(tmp_path, "wb") as f:
-                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(tmp_path, steps_path)
-    
+
+            def _write_steps(path: Path) -> None:
+                with open(path, "wb") as f:
+                    pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            _commit_cache_file(steps_path, _write_steps)
             print(f"[RANK 0] Cached steps saved to {steps_path}")
     
         # ---------- sync after rank0  ----------
