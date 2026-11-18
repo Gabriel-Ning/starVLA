@@ -1,0 +1,3 @@
+display_name: Sync Fork Commits
+short_description: Rebase a fork branch onto upstream safely.
+default_prompt: Sync this fork branch to the upstream main branch, replaying my local commits in order and dropping commits already present upstream.
